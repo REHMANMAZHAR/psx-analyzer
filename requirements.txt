@@ -6,4 +6,4 @@ yfinance>=0.2.40
 requests>=2.31
 beautifulsoup4>=4.12
 streamlit-autorefresh>=1.0.1
- 
+feedparser>=6.0.10
