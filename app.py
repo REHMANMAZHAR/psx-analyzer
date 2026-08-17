@@ -1,5 +1,7 @@
 
+App · PY
 import io
+import time
 from dataclasses import dataclass
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
@@ -27,11 +29,58 @@ except ImportError:
 st.set_page_config(page_title="PSX Analyzer", page_icon="📈", layout="wide")
  
 KARACHI_TZ = ZoneInfo("Asia/Karachi")
+PSX_BASE = "https://dps.psx.com.pk"
 PSX_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                   "(KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-    "Accept": "text/html,application/json",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": f"{PSX_BASE}/market-watch",
+    "Origin": PSX_BASE,
+    "X-Requested-With": "XMLHttpRequest",
+    "Connection": "keep-alive",
+    "Sec-Fetch-Site": "same-origin",
+    "Sec-Fetch-Mode": "cors",
 }
+ 
+ 
+@st.cache_resource(show_spinner=False)
+def _psx_session() -> requests.Session:
+    """A shared, browser-like session. PSX's server appears to block bare scripted
+    requests (no cookies/referer) from datacenter IPs — visiting the homepage first to
+    pick up cookies, and sending the same headers its own page JS would send, gets past
+    that without needing anything fancier."""
+    s = requests.Session()
+    s.headers.update({
+        "User-Agent": PSX_HEADERS["User-Agent"],
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    try:
+        s.get(PSX_BASE + "/", timeout=15)
+        s.get(PSX_BASE + "/market-watch", timeout=15)
+    except Exception:
+        pass  # best-effort cookie warm-up; the real request below still tries regardless
+    return s
+ 
+ 
+def _psx_request(method: str, url: str, retries: int = 2, **kwargs) -> requests.Response:
+    """requests.get/post through the shared PSX session, with a couple of quick retries
+    for the transient connection resets PSX's edge occasionally throws at scripted clients."""
+    session = _psx_session()
+    last_exc = None
+    for attempt in range(retries + 1):
+        try:
+            resp = session.request(method, url, headers=PSX_HEADERS, timeout=kwargs.pop("timeout", 15), **kwargs)
+            if resp.status_code == 403 or resp.status_code >= 500 or resp.status_code == 469:
+                last_exc = ValueError(f"PSX blocked the request (HTTP {resp.status_code})")
+                time.sleep(0.6 * (attempt + 1))
+                continue
+            resp.raise_for_status()
+            return resp
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(0.6 * (attempt + 1))
+    raise last_exc
  
  
 @dataclass
@@ -114,7 +163,7 @@ def is_market_open(now: datetime | None = None) -> bool:
 def fetch_live_quote(symbol: str) -> dict:
     """Scrape the current row for `symbol` from the PSX Data Portal market-watch table."""
     target = symbol.upper().strip()
-    resp = requests.get("https://dps.psx.com.pk/market-watch", headers=PSX_HEADERS, timeout=12)
+    resp = _psx_request("GET", f"{PSX_BASE}/market-watch", timeout=15)
     resp.raise_for_status()
     soup = BeautifulSoup(resp.text, "html.parser")
  
@@ -154,7 +203,7 @@ def fetch_live_quote(symbol: str) -> dict:
 def fetch_intraday_ticks(symbol: str) -> pd.DataFrame:
     """Pull today's intraday tick series from the PSX Data Portal timeseries API."""
     target = symbol.upper().strip()
-    resp = requests.post(f"https://dps.psx.com.pk/timeseries/int/{target}", headers=PSX_HEADERS, timeout=12)
+    resp = _psx_request("POST", f"{PSX_BASE}/timeseries/int/{target}", timeout=15)
     resp.raise_for_status()
     payload = resp.json()
     rows = payload.get("data", [])
@@ -173,7 +222,7 @@ def fetch_psx_eod(symbol: str) -> tuple[pd.DataFrame, bool]:
     when that happens the caller blends it onto a Yahoo OHLC backbone rather than faking
     high/low, which would silently wreck pivot/ATR-based levels and candlesticks."""
     target = symbol.upper().strip()
-    resp = requests.post(f"https://dps.psx.com.pk/timeseries/eod/{target}", headers=PSX_HEADERS, timeout=20)
+    resp = _psx_request("POST", f"{PSX_BASE}/timeseries/eod/{target}", timeout=20)
     resp.raise_for_status()
     payload = resp.json()
     rows = payload.get("data", [])
@@ -346,12 +395,39 @@ def download_data(symbol: str, period: str) -> tuple[pd.DataFrame, str]:
     return normalize_columns(df), f"Yahoo Finance ({ticker})"
  
  
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_valid_symbols() -> set[str]:
+    """The full list of tradeable PSX symbols, scraped once a day from the same market-watch
+    table the live quote uses. Lets us reject a typo'd ticker in milliseconds instead of
+    waiting on two slow, possibly-blocked network calls only to fail with a confusing error."""
+    resp = _psx_request("GET", f"{PSX_BASE}/market-watch", timeout=20)
+    soup = BeautifulSoup(resp.text, "html.parser")
+    symbols = set()
+    for tr in soup.find_all("tr"):
+        link = tr.find("a")
+        if link:
+            txt = link.get_text(strip=True).upper()
+            if txt:
+                symbols.add(txt)
+    return symbols
+ 
+ 
 def load_historical(symbol: str, period: str, prefer_psx: bool) -> tuple[pd.DataFrame, str, str | None]:
     """Load daily OHLCV history, preferring PSX's own EOD feed when it carries full OHLC.
     If PSX only returns close+volume (no daily high/low), the Yahoo OHLC shape is kept and
     PSX's own close prices are substituted in wherever dates overlap, so the exchange's own
     print is used without breaking candlesticks or ATR/pivot-based support-resistance."""
     note = None
+    target = symbol.upper().strip()
+    try:
+        valid = fetch_valid_symbols()
+        if valid and target not in valid:
+            raise ValueError(f"'{target}' was not found on PSX's own symbol list. Check the ticker spelling.")
+    except ValueError:
+        raise
+    except Exception:
+        pass  # validation call itself failed (e.g. PSX blocked it) — don't block the real fetch on that
+ 
     if not prefer_psx:
         df, source = download_data(symbol, period)
         return df, source, note
@@ -694,6 +770,148 @@ def screen_symbol(symbol: str, period: str, use_live: bool, prefer_psx_history: 
     return row
  
  
+# --------------------------------------------------------------------------------------
+# Backtesting. Walk-forward test of the Breakout rule and a simplified (rolling-low-based)
+# version of the Buy Call rule against this stock's own history. Entries fire the day AFTER
+# a signal is confirmed (using that day's open), so there's no look-ahead; exits are the
+# first of stop, target, or a fixed holding horizon. The Buy Call backtest intentionally
+# uses a fast rolling-low proxy for "support" instead of the full multi-source confluence
+# levels in the live Trade Plan — recomputing those for every historical day would be far
+# too slow for a web request — so treat results as indicative, not identical to what the
+# live badge would have said on any given historical day.
+# --------------------------------------------------------------------------------------
+ 
+def backtest_signals(df: pd.DataFrame, horizon: int = 10, stop_atr: float = 1.5, target_atr: float = 3.0) -> dict:
+    d = add_breakout_indicators(add_indicators(df))
+    d["RollingLow20"] = d["Low"].rolling(20).min()
+    n = len(d)
+ 
+    def run(entry_mask: pd.Series, label: str) -> dict:
+        trades = []
+        prev_active = False
+        for i in range(n):
+            active = bool(entry_mask.iloc[i]) if pd.notna(entry_mask.iloc[i]) else False
+            if not active:
+                prev_active = False
+                continue
+            if prev_active:
+                continue  # only count fresh transitions into a signal, not every day it persists
+            prev_active = True
+            entry_idx = i + 1
+            if entry_idx >= n:
+                continue
+            entry_price = float(d["Open"].iloc[entry_idx])
+            atr = d["ATR14"].iloc[i]
+            if pd.isna(atr) or atr <= 0 or pd.isna(entry_price):
+                continue
+            stop = entry_price - stop_atr * atr
+            target = entry_price + target_atr * atr
+            exit_price, exit_reason, hold_days = None, "horizon", 0
+            for h in range(entry_idx, min(entry_idx + horizon, n)):
+                hold_days = h - entry_idx + 1
+                if d["Low"].iloc[h] <= stop:
+                    exit_price, exit_reason = stop, "stop"
+                    break
+                if d["High"].iloc[h] >= target:
+                    exit_price, exit_reason = target, "target"
+                    break
+            if exit_price is None:
+                last_h = min(entry_idx + horizon, n) - 1
+                exit_price = float(d["Close"].iloc[last_h])
+                hold_days = last_h - entry_idx + 1
+            ret_pct = (exit_price / entry_price - 1) * 100
+            trades.append({"Entry Date": d.index[entry_idx].date().isoformat(), "Entry": round(entry_price, 2),
+                            "Exit": round(exit_price, 2), "Return %": round(ret_pct, 2),
+                            "Exit Reason": exit_reason, "Hold (days)": hold_days})
+        if not trades:
+            return {"label": label, "trades": 0, "win_rate": None, "avg_return": None,
+                    "avg_winner": None, "avg_loser": None, "avg_hold_days": None, "records": trades}
+        rets = [t["Return %"] for t in trades]
+        wins = [r for r in rets if r > 0]
+        losses = [r for r in rets if r <= 0]
+        return {
+            "label": label, "trades": len(trades),
+            "win_rate": len(wins) / len(trades) * 100,
+            "avg_return": float(np.mean(rets)),
+            "avg_winner": float(np.mean(wins)) if wins else None,
+            "avg_loser": float(np.mean(losses)) if losses else None,
+            "avg_hold_days": float(np.mean([t["Hold (days)"] for t in trades])),
+            "records": trades,
+        }
+ 
+    vol_ratio = d["Volume"] / d["VOL20"]
+    vol_ok = vol_ratio >= 1.3
+    macd_up = (d["MACD_Hist"] > 0) & (d["MACD_Hist"] > d["MACD_Hist"].shift(1))
+    adx_up = (d["ADX14"] > 20) & (d["ADX14"] > d["ADX14"].shift(5)) & (d["Plus_DI"] > d["Minus_DI"])
+    breakout_entry = (d["Close"] > d["Donch20_Upper"]) & vol_ok & (macd_up | adx_up)
+ 
+    ema_stack_ok = (d["Close"] > d["EMA20"]) | (d["EMA20"] > d["EMA50"])
+    near_support = (d["Low"] <= d["RollingLow20"] * 1.02) & (d["Close"] >= d["RollingLow20"] * 0.985)
+    rsi_ok = d["RSI14"] < 70
+    buycall_entry = ema_stack_ok & near_support & rsi_ok
+ 
+    return {
+        "breakout": run(breakout_entry.fillna(False), "Breakout Up"),
+        "buy_call": run(buycall_entry.fillna(False), "Buy Call (rolling-low proxy)"),
+    }
+ 
+ 
+# --------------------------------------------------------------------------------------
+# Portfolio tracker. Live P&L against user-entered holdings, plus a chandelier-style
+# trailing stop (highest close since entry, minus 1.5×ATR) so a held position gets an
+# evolving, mechanical stop suggestion rather than a static one that never adapts as a
+# stock runs up.
+# --------------------------------------------------------------------------------------
+ 
+def evaluate_position(symbol: str, qty: float, entry_price: float, entry_date, period: str,
+                       use_live: bool, prefer_psx_history: bool) -> dict:
+    df, _source, _note = load_historical(symbol, period, prefer_psx_history)
+    live = None
+    if use_live:
+        try:
+            live = fetch_live_quote(symbol)
+            df = merge_live_into_daily(df, live)
+        except Exception:
+            live = None
+ 
+    if len(df) < 60:
+        raise ValueError("not enough price history")
+ 
+    d = add_breakout_indicators(add_indicators(df))
+    current = float(d["Close"].iloc[-1])
+    atr = float(d["ATR14"].iloc[-1]) if pd.notna(d["ATR14"].iloc[-1]) else current * 0.02
+    trend, trend_score = trend_label(d)
+    rsi = float(d["RSI14"].iloc[-1]) if pd.notna(d["RSI14"].iloc[-1]) else None
+    levels, _ = calculate_levels(df)
+    verdict = evaluate_buy_call(current, atr, levels, rsi, trend_score)
+    breakout = evaluate_breakout(d)
+ 
+    if entry_date is not None and not (isinstance(entry_date, float) and pd.isna(entry_date)):
+        since = d[d.index >= pd.Timestamp(entry_date)]
+        highest_close = float(since["Close"].max()) if len(since) else current
+    else:
+        highest_close = float(d.tail(60)["Close"].max())
+    suggested_stop = highest_close - 1.5 * atr
+ 
+    pnl = (current - entry_price) * qty
+    pnl_pct = (current / entry_price - 1) * 100 if entry_price else None
+ 
+    return {
+        "Symbol": symbol.upper().strip(),
+        "Quantity": qty,
+        "Entry Price": round(entry_price, 2),
+        "Current Price": round(current, 2),
+        "P&L (Rs)": round(pnl, 2),
+        "P&L %": round(pnl_pct, 2) if pnl_pct is not None else None,
+        "Trend": trend,
+        "Call": verdict["call"],
+        "Breakout": breakout["signal"],
+        "Trailing Stop": round(suggested_stop, 2),
+        "Stop Breached": "⚠ Yes" if current < suggested_stop else "No",
+        "Live": "Yes" if live else "No",
+    }
+ 
+ 
 st.title("PSX Analyzer — Phase 1")
 st.caption("Type a PSX symbol. The app pulls a live quote from the PSX Data Portal, finds support/resistance zones, "
            "trend, volatility, stop-loss and targets. Levels are probabilities—not guarantees.")
@@ -725,6 +943,10 @@ with st.sidebar:
     now_pk = datetime.now(KARACHI_TZ)
     status = "🟢 Market Open" if is_market_open(now_pk) else "🔴 Market Closed"
     st.caption(f"{status} · {now_pk.strftime('%Y-%m-%d %H:%M')} PKT (approximate session window)")
+    if "last_live_update" in st.session_state:
+        st.caption(f"✅ Last successful PSX live update: {st.session_state.last_live_update}")
+    else:
+        st.caption("No successful PSX live update yet this session.")
     st.caption("Live quotes and history come from the PSX Data Portal (dps.psx.com.pk), which the exchange itself "
                "marks as delayed a few minutes during trading. For execution decisions, always confirm with your broker terminal.")
  
@@ -746,6 +968,7 @@ if analyze or "ran" not in st.session_state:
                         live = fetch_live_quote(symbol)
                         df = merge_live_into_daily(df, live)
                         source = f"{source} + PSX Data Portal live quote"
+                        st.session_state.last_live_update = live["fetched_at"].strftime("%Y-%m-%d %H:%M:%S %Z")
                     except Exception as exc:
                         live_error = str(exc)
  
@@ -795,8 +1018,8 @@ if analyze or "ran" not in st.session_state:
         c4.metric("Nearest Support", f"Rs {s1:,.2f}", f"{(s1/current-1):.2%}")
         c5.metric("Nearest Resistance", f"Rs {r1:,.2f}", f"{(r1/current-1):.2%}")
  
-        tab1, tab2, tab3, tab4, tab5 = st.tabs(
-            ["Chart & Levels", "Trade Plan", "Data & Method", "📰 News", "🔎 Buy Call Screener"])
+        tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
+            ["Chart & Levels", "Trade Plan", "Data & Method", "📰 News", "🔎 Buy Call Screener", "🧪 Backtest"])
         with tab1:
             st.plotly_chart(chart(d, levels, symbol.upper()), use_container_width=True)
  
@@ -923,6 +1146,7 @@ if analyze or "ran" not in st.session_state:
                     except Exception as exc2:
                         errors.append(f"{sym}: {exc2}")
                     progress.progress((i + 1) / len(symbols))
+                    time.sleep(0.35)  # spread requests out so a burst scan doesn't trip PSX's anti-bot filter
                 progress.empty()
                 status.empty()
                 st.session_state.screen_results = results
@@ -959,6 +1183,128 @@ if analyze or "ran" not in st.session_state:
             else:
                 st.caption("Enter symbols above and click **Scan Watchlist** to run the screen.")
  
+        with tab6:
+            st.caption(f"Walk-forward test of the Breakout rule and a simplified Buy Call rule on {symbol.upper()}'s "
+                       "own history — entries fire the day after a signal is confirmed, exits are the first of stop, "
+                       "target, or a fixed holding window. Past performance on this stock's own history does not "
+                       "guarantee future results.")
+            with st.expander("Backtest settings"):
+                bt_horizon = st.slider("Max holding period (sessions)", 3, 30, 10)
+                bt_stop = st.slider("Stop distance (× ATR)", 0.5, 3.0, 1.5, 0.1)
+                bt_target = st.slider("Target distance (× ATR)", 1.0, 6.0, 3.0, 0.1)
+            run_bt = st.button("Run Backtest", type="primary")
+            if run_bt:
+                with st.spinner("Running walk-forward backtest..."):
+                    bt = backtest_signals(df, horizon=bt_horizon, stop_atr=bt_stop, target_atr=bt_target)
+                st.session_state.backtest_result = bt
+                st.session_state.backtest_symbol = symbol.upper()
+ 
+            if st.session_state.get("backtest_result") and st.session_state.get("backtest_symbol") == symbol.upper():
+                bt = st.session_state.backtest_result
+                for key, title in [("breakout", "🚀 Breakout Up"), ("buy_call", "📉 Buy Call (rolling-low proxy)")]:
+                    res = bt[key]
+                    st.subheader(title)
+                    if not res["trades"]:
+                        st.info("No historical signals found for this rule on this symbol's available history.")
+                        continue
+                    m1, m2, m3, m4, m5 = st.columns(5)
+                    m1.metric("Signals", res["trades"])
+                    m2.metric("Win rate", f"{res['win_rate']:.0f}%")
+                    m3.metric("Avg return", f"{res['avg_return']:+.2f}%")
+                    m4.metric("Avg winner / loser", f"{res['avg_winner']:+.2f}% / {res['avg_loser']:+.2f}%")
+                    m5.metric("Avg hold", f"{res['avg_hold_days']:.1f} sessions")
+                    with st.expander(f"{res['trades']} individual trades"):
+                        st.dataframe(pd.DataFrame(res["records"]), use_container_width=True, hide_index=True)
+            else:
+                st.caption("Click **Run Backtest** to test these rules against this symbol's own history.")
+ 
     except Exception as exc:
         st.error(f"Could not analyze {symbol.upper()}: {exc}")
         st.info("Try the exact PSX symbol, or upload a CSV containing Date, Open, High, Low, Close and Volume.")
+ 
+ 
+# --------------------------------------------------------------------------------------
+# Portfolio tracker — always available, independent of the symbol in the sidebar search.
+# Data entered here lives only in this browser session (st.session_state); it resets on
+# page reload or redeploy. Use the CSV export/import to carry it between sessions.
+# --------------------------------------------------------------------------------------
+ 
+st.divider()
+with st.expander("💼 Portfolio Tracker — live P&L and stop-loss alerts for your real holdings", expanded=False):
+    st.caption("Entries here only persist for this browser session — they reset on page reload or redeploy. "
+               "Download the CSV after entering your holdings, and re-upload it next time to restore them. "
+               "The 'Trailing Stop' is a mechanical chandelier-style suggestion (highest close since your entry "
+               "date, minus 1.5×ATR) — not personalized advice, and it doesn't know about your broader plan.")
+ 
+    if "portfolio_df" not in st.session_state:
+        st.session_state.portfolio_df = pd.DataFrame([{"Symbol": "", "Quantity": 0, "Entry Price": 0.0, "Entry Date": None}])
+ 
+    port_upload = st.file_uploader("Restore portfolio from a previously downloaded CSV", type=["csv"], key="portfolio_upload")
+    if port_upload is not None:
+        try:
+            restored = pd.read_csv(port_upload, parse_dates=["Entry Date"])
+            st.session_state.portfolio_df = restored
+            st.success(f"Restored {len(restored)} holding(s) from CSV.")
+        except Exception as exc:
+            st.error(f"Could not read that CSV: {exc}")
+ 
+    edited_portfolio = st.data_editor(
+        st.session_state.portfolio_df, num_rows="dynamic", use_container_width=True, key="portfolio_editor",
+        column_config={
+            "Symbol": st.column_config.TextColumn(required=True),
+            "Quantity": st.column_config.NumberColumn(min_value=0, step=1),
+            "Entry Price": st.column_config.NumberColumn(min_value=0.0, format="%.2f"),
+            "Entry Date": st.column_config.DateColumn(help="Optional — improves the trailing-stop calculation."),
+        },
+    )
+    st.session_state.portfolio_df = edited_portfolio
+ 
+    update_portfolio = st.button("Update Portfolio (fetch live prices)", type="primary")
+    if update_portfolio:
+        rows = edited_portfolio[(edited_portfolio["Symbol"].astype(str).str.strip() != "") &
+                                 (edited_portfolio["Quantity"].fillna(0) > 0)]
+        pf_results, pf_errors = [], []
+        pf_progress = st.progress(0.0)
+        for i, r in enumerate(rows.itertuples(index=False)):
+            sym = str(r.Symbol).strip().upper()
+            try:
+                entry_date_val = r._3 if len(r) > 3 else None
+                pf_results.append(evaluate_position(sym, float(r.Quantity), float(r._2), entry_date_val,
+                                                      "2y", True, prefer_psx_history))
+            except Exception as exc2:
+                pf_errors.append(f"{sym}: {exc2}")
+            pf_progress.progress((i + 1) / max(len(rows), 1))
+            time.sleep(0.35)
+        pf_progress.empty()
+        st.session_state.portfolio_results = pf_results
+        st.session_state.portfolio_errors = pf_errors
+ 
+    if st.session_state.get("portfolio_results"):
+        pdf = pd.DataFrame(st.session_state.portfolio_results)
+        total_value = float((pdf["Current Price"] * pdf["Quantity"]).sum())
+        total_cost = float((pdf["Entry Price"] * pdf["Quantity"]).sum())
+        total_pl = total_value - total_cost
+        total_pl_pct = (total_pl / total_cost * 100) if total_cost else 0.0
+ 
+        pm1, pm2, pm3 = st.columns(3)
+        pm1.metric("Portfolio Value", f"Rs {total_value:,.0f}")
+        pm2.metric("Total Cost", f"Rs {total_cost:,.0f}")
+        pm3.metric("Unrealized P&L", f"Rs {total_pl:,.0f}", f"{total_pl_pct:+.2f}%")
+ 
+        st.dataframe(pdf.drop(columns=["Live"]), use_container_width=True, hide_index=True)
+ 
+        breached = pdf[pdf["Stop Breached"] == "⚠ Yes"]
+        if not breached.empty:
+            st.warning(f"⚠ {len(breached)} position(s) have breached their suggested trailing stop: " +
+                       ", ".join(breached["Symbol"]))
+ 
+        export_csv = edited_portfolio.to_csv(index=False).encode("utf-8")
+        st.download_button("Download portfolio (CSV)", export_csv, file_name="psx_portfolio.csv", mime="text/csv")
+ 
+        if st.session_state.get("portfolio_errors"):
+            with st.expander(f"Skipped {len(st.session_state.portfolio_errors)} holding(s)"):
+                for e in st.session_state.portfolio_errors:
+                    st.caption(e)
+    else:
+        st.caption("Enter your holdings above and click **Update Portfolio** to fetch live prices and P&L.")
+ 
